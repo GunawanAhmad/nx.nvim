@@ -1,0 +1,252 @@
+local M = {}
+
+local config = {
+  nx_cmd = nil,       -- auto-detected if nil (pnpm/yarn/bun/npx/nx)
+  runner_bin = nil,   -- path to nx-runner binary; auto-resolved if nil
+  terminal = "horizontal", -- "horizontal" | "vertical" | "float"
+  float_opts = { width = 0.8, height = 0.8 },
+}
+
+-- resolve the nx-runner binary: explicit config > sibling to plugin > PATH
+local function runner_bin()
+  if config.runner_bin then return config.runner_bin end
+  -- try next to the plugin directory (go/nx-runner)
+  local src = debug.getinfo(1, "S").source:sub(2)
+  local plugin_root = vim.fn.fnamemodify(src, ":h:h:h")
+  local candidate = plugin_root .. "/go/nx-runner"
+  if vim.fn.executable(candidate) == 1 then return candidate end
+  if vim.fn.executable("nx-runner") == 1 then return "nx-runner" end
+  return nil
+end
+
+local function get_workspace_root()
+  local path = vim.fn.getcwd()
+  while path ~= "/" do
+    if vim.fn.filereadable(path .. "/nx.json") == 1 then return path end
+    path = vim.fn.fnamemodify(path, ":h")
+  end
+  return nil
+end
+
+local function detect_nx_cmd(root)
+  if config.nx_cmd then return config.nx_cmd end
+  if vim.fn.filereadable(root .. "/pnpm-lock.yaml") == 1 then return "pnpm nx" end
+  if vim.fn.filereadable(root .. "/yarn.lock") == 1 then return "yarn nx" end
+  if vim.fn.filereadable(root .. "/bun.lockb") == 1 or vim.fn.filereadable(root .. "/bun.lock") == 1 then
+    return "bunx nx"
+  end
+  if vim.fn.filereadable(root .. "/package-lock.json") == 1 then return "npx nx" end
+  if vim.fn.executable("nx") == 1 then return "nx" end
+  return "npx nx"
+end
+
+local function run_in_terminal(cmd)
+  local term = config.terminal
+  if term == "float" then
+    local w = math.floor(vim.o.columns * config.float_opts.width)
+    local h = math.floor(vim.o.lines * config.float_opts.height)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_open_win(buf, true, {
+      relative = "editor",
+      width = w, height = h,
+      row = math.floor((vim.o.lines - h) / 2),
+      col = math.floor((vim.o.columns - w) / 2),
+      style = "minimal", border = "rounded",
+    })
+    vim.fn.termopen(cmd)
+    vim.cmd("startinsert")
+  elseif term == "vertical" then
+    vim.cmd("vsplit | terminal " .. cmd)
+    vim.cmd("startinsert")
+  else
+    vim.cmd("split | terminal " .. cmd)
+    vim.cmd("startinsert")
+  end
+end
+
+-- use nx-runner binary for fast filesystem-based listing
+local function get_projects()
+  local root = get_workspace_root()
+  if not root then return {} end
+
+  local bin = runner_bin()
+  local raw
+  if bin then
+    raw = vim.fn.systemlist("cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null")
+  else
+    -- fallback: call nx CLI
+    local nx = detect_nx_cmd(root)
+    raw = vim.fn.systemlist("cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null")
+  end
+  if vim.v.shell_error ~= 0 then return {} end
+
+  local projects = {}
+  for _, line in ipairs(raw) do
+    local t = vim.trim(line)
+    if t ~= "" then table.insert(projects, t) end
+  end
+  return projects
+end
+
+local function get_targets_for_project(project)
+  local root = get_workspace_root()
+  if not root then return {} end
+
+  local bin = runner_bin()
+  if bin then
+    local raw = vim.fn.systemlist(
+      "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " targets " .. vim.fn.shellescape(project) .. " 2>/dev/null"
+    )
+    if vim.v.shell_error ~= 0 then return {} end
+    local targets = {}
+    for _, line in ipairs(raw) do
+      local t = vim.trim(line)
+      if t ~= "" then table.insert(targets, t) end
+    end
+    return targets
+  end
+
+  -- fallback: nx CLI with JSON parsing
+  local nx = detect_nx_cmd(root)
+  local result = vim.fn.systemlist(
+    "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show project " .. vim.fn.shellescape(project) .. " --json 2>/dev/null"
+  )
+  if vim.v.shell_error ~= 0 then return {} end
+
+  local json_start = 0
+  for i, line in ipairs(result) do
+    if vim.trim(line):sub(1, 1) == "{" then json_start = i; break end
+  end
+  if json_start == 0 then return {} end
+
+  local ok, data = pcall(vim.fn.json_decode, table.concat(result, "\n", json_start))
+  if not ok or type(data) ~= "table" or not data.targets then return {} end
+
+  local targets = {}
+  for target in pairs(data.targets) do table.insert(targets, target) end
+  table.sort(targets)
+  return targets
+end
+
+function M.run(project, target, args)
+  local root = get_workspace_root()
+  if not root then
+    vim.notify("nx.nvim: nx.json not found in any parent directory", vim.log.levels.ERROR)
+    return
+  end
+
+  local bin = runner_bin()
+  local cmd
+  if bin and project and target then
+    cmd = bin .. " run " .. vim.fn.shellescape(project) .. " " .. vim.fn.shellescape(target)
+    if args and args ~= "" then cmd = cmd .. " " .. args end
+  else
+    local nx = detect_nx_cmd(root)
+    if project and target then
+      cmd = nx .. " run " .. project .. ":" .. target
+      if args and args ~= "" then cmd = cmd .. " " .. args end
+    elseif project then
+      cmd = nx .. " " .. project
+    else
+      vim.notify("nx.nvim: project required", vim.log.levels.WARN)
+      return
+    end
+  end
+
+  run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. cmd)
+end
+
+function M.pick_project_target()
+  local projects = get_projects()
+  if vim.tbl_isempty(projects) then
+    vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
+    return
+  end
+
+  vim.ui.select(projects, { prompt = "NX Project> " }, function(project)
+    if not project then return end
+
+    local targets = get_targets_for_project(project)
+    if vim.tbl_isempty(targets) then
+      vim.notify("nx.nvim: no targets for " .. project, vim.log.levels.WARN)
+      return
+    end
+
+    vim.ui.select(targets, { prompt = "NX Target (" .. project .. ")> " }, function(target)
+      if not target then return end
+      M.run(project, target)
+    end)
+  end)
+end
+
+function M.pick_project()
+  local projects = get_projects()
+  if vim.tbl_isempty(projects) then
+    vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
+    return
+  end
+  vim.ui.select(projects, { prompt = "NX Project> " }, function(project)
+    if not project then return end
+    M.run(project)
+  end)
+end
+
+function M.run_affected(target)
+  local root = get_workspace_root()
+  if not root then
+    vim.notify("nx.nvim: nx.json not found", vim.log.levels.ERROR)
+    return
+  end
+  local nx = detect_nx_cmd(root)
+  if not target then
+    vim.ui.input({ prompt = "NX Affected Target: " }, function(t)
+      if t and t ~= "" then
+        run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " affected --target=" .. t)
+      end
+    end)
+    return
+  end
+  run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " affected --target=" .. target)
+end
+
+function M.graph()
+  local root = get_workspace_root()
+  if not root then
+    vim.notify("nx.nvim: nx.json not found", vim.log.levels.ERROR)
+    return
+  end
+  run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. detect_nx_cmd(root) .. " graph")
+end
+
+function M.setup(opts)
+  config = vim.tbl_deep_extend("force", config, opts or {})
+
+  vim.api.nvim_create_user_command("NxRun", function(args)
+    local parts = vim.split(args.args, "%s+", { trimempty = true })
+    M.run(parts[1], parts[2], table.concat(vim.list_slice(parts, 3), " "))
+  end, {
+    nargs = "+",
+    desc = "Run nx <project> <target> [args]",
+    complete = function(arglead, cmdline, _)
+      local parts = vim.split(cmdline, "%s+", { trimempty = true })
+      if #parts <= 2 then
+        return vim.tbl_filter(function(p) return p:find(arglead, 1, true) end, get_projects())
+      elseif #parts == 3 then
+        return vim.tbl_filter(function(t) return t:find(arglead, 1, true) end, get_targets_for_project(parts[2]))
+      end
+      return {}
+    end,
+  })
+
+  vim.api.nvim_create_user_command("NxPick", function() M.pick_project_target() end,
+    { desc = "Interactively pick nx project and target" })
+
+  vim.api.nvim_create_user_command("NxAffected", function(args)
+    M.run_affected(args.args ~= "" and args.args or nil)
+  end, { nargs = "?", desc = "Run nx affected --target=<target>" })
+
+  vim.api.nvim_create_user_command("NxGraph", function() M.graph() end,
+    { desc = "Open nx graph" })
+end
+
+return M
