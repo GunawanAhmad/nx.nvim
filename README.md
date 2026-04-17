@@ -1,10 +1,10 @@
 # nx.nvim
 
-Fast NX monorepo runner for Neovim. Pick projects and targets interactively via `vim.ui.select`, powered by a Go binary that reads `project.json` files directly instead of spawning the NX CLI.
+Run NX targets without leaving Neovim. Pick any project and target from a fuzzy menu and run it in a split.
 
 ## Why
 
-The standard approach calls `nx show projects` and `nx show project <name> --json` sequentially — each spawns Node.js and boots the NX runtime. On large monorepos this adds multiple seconds of latency per lookup. The bundled `nx-runner` binary walks the filesystem and parses `project.json` files directly, making listings near-instant.
+On large monorepos, looking up projects and targets can be slow. The bundled `nx-runner` binary walks the filesystem and parses `project.json` files directly, making listings near-instant.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ Or install it anywhere on your `$PATH`.
 **lazy.nvim**
 ```lua
 {
-  "yourusername/nx.nvim",
+  "gunawanahmad/nx.nvim",
   config = function()
     require("nx").setup()
   end,
@@ -38,7 +38,7 @@ Or install it anywhere on your `$PATH`.
 **packer.nvim**
 ```lua
 use {
-  "yourusername/nx.nvim",
+  "gunawanahmad/nx.nvim",
   config = function()
     require("nx").setup()
   end,
