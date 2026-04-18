@@ -1,5 +1,7 @@
 local M = {}
 
+local _cache = { root = nil, projects = nil, targets = {} }
+
 local config = {
   nx_cmd = nil,       -- auto-detected if nil (pnpm/yarn/bun/npx/nx)
   runner_bin = nil,   -- path to nx-runner binary; auto-resolved if nil
@@ -69,12 +71,13 @@ local function get_projects()
   local root = get_workspace_root()
   if not root then return {} end
 
+  if _cache.root == root and _cache.projects then return _cache.projects end
+
   local bin = runner_bin()
   local raw
   if bin then
     raw = vim.fn.systemlist("cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null")
   else
-    -- fallback: call nx CLI
     local nx = detect_nx_cmd(root)
     raw = vim.fn.systemlist("cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null")
   end
@@ -83,8 +86,10 @@ local function get_projects()
   local projects = {}
   for _, line in ipairs(raw) do
     local t = vim.trim(line)
-    if t ~= "" then table.insert(projects, t) end
+    if t ~= "" and not t:match("^>") then table.insert(projects, t) end
   end
+  _cache.root = root
+  _cache.projects = projects
   return projects
 end
 
@@ -92,39 +97,40 @@ local function get_targets_for_project(project)
   local root = get_workspace_root()
   if not root then return {} end
 
+  if _cache.root == root and _cache.targets[project] then return _cache.targets[project] end
+
+  local targets = {}
   local bin = runner_bin()
   if bin then
     local raw = vim.fn.systemlist(
       "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " targets " .. vim.fn.shellescape(project) .. " 2>/dev/null"
     )
     if vim.v.shell_error ~= 0 then return {} end
-    local targets = {}
     for _, line in ipairs(raw) do
       local t = vim.trim(line)
       if t ~= "" then table.insert(targets, t) end
     end
-    return targets
+  else
+    local nx = detect_nx_cmd(root)
+    local result = vim.fn.systemlist(
+      "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show project " .. vim.fn.shellescape(project) .. " --json 2>/dev/null"
+    )
+    if vim.v.shell_error ~= 0 then return {} end
+
+    local json_start = 0
+    for i, line in ipairs(result) do
+      if vim.trim(line):sub(1, 1) == "{" then json_start = i; break end
+    end
+    if json_start == 0 then return {} end
+
+    local ok, data = pcall(vim.fn.json_decode, table.concat(result, "\n", json_start))
+    if not ok or type(data) ~= "table" or not data.targets then return {} end
+
+    for target in pairs(data.targets) do table.insert(targets, target) end
+    table.sort(targets)
   end
 
-  -- fallback: nx CLI with JSON parsing
-  local nx = detect_nx_cmd(root)
-  local result = vim.fn.systemlist(
-    "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show project " .. vim.fn.shellescape(project) .. " --json 2>/dev/null"
-  )
-  if vim.v.shell_error ~= 0 then return {} end
-
-  local json_start = 0
-  for i, line in ipairs(result) do
-    if vim.trim(line):sub(1, 1) == "{" then json_start = i; break end
-  end
-  if json_start == 0 then return {} end
-
-  local ok, data = pcall(vim.fn.json_decode, table.concat(result, "\n", json_start))
-  if not ok or type(data) ~= "table" or not data.targets then return {} end
-
-  local targets = {}
-  for target in pairs(data.targets) do table.insert(targets, target) end
-  table.sort(targets)
+  _cache.targets[project] = targets
   return targets
 end
 
@@ -266,6 +272,11 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("NxGraph", function() M.graph() end,
     { desc = "Open nx graph" })
+
+  vim.api.nvim_create_user_command("NxRefresh", function()
+    _cache.root = nil; _cache.projects = nil; _cache.targets = {}
+    vim.notify("nx.nvim: cache cleared", vim.log.levels.INFO)
+  end, { desc = "Clear nx.nvim project/target cache" })
 end
 
 return M
