@@ -71,13 +71,15 @@ local function get_projects()
   if _cache.root == root and _cache.projects then return _cache.projects end
 
   local bin = runner_bin()
-  local raw
+  local cmd
   if bin then
-    raw = vim.fn.systemlist("cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null")
+    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null"
   else
     local nx = detect_nx_cmd(root)
-    raw = vim.fn.systemlist("cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null")
+    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null"
   end
+
+  local raw = vim.fn.systemlist(cmd)
   if vim.v.shell_error ~= 0 then return {} end
 
   local projects = {}
@@ -88,6 +90,36 @@ local function get_projects()
   _cache.root = root
   _cache.projects = projects
   return projects
+end
+
+local function get_projects_async(cb)
+  local root = get_workspace_root()
+  if not root then cb({}); return end
+  if _cache.root == root and _cache.projects then cb(_cache.projects); return end
+
+  local bin = runner_bin()
+  local cmd
+  if bin then
+    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null"
+  else
+    local nx = detect_nx_cmd(root)
+    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null"
+  end
+
+  vim.system({ "sh", "-c", cmd }, { text = true }, function(result)
+    vim.schedule(function()
+      local projects = {}
+      if result.code == 0 then
+        for _, line in ipairs(vim.split(result.stdout or "", "\n")) do
+          local t = vim.trim(line)
+          if t ~= "" and not t:match("^>") then table.insert(projects, t) end
+        end
+      end
+      _cache.root = root
+      _cache.projects = projects
+      cb(projects)
+    end)
+  end)
 end
 
 local function get_targets_for_project(project)
@@ -159,22 +191,74 @@ function M.run(project, target, args)
   run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. cmd)
 end
 
+local function pick_with_telescope()
+  local ok, pickers  = pcall(require, "telescope.pickers")
+  if not ok then return false end
+  local finders      = require("telescope.finders")
+  local conf         = require("telescope.config").values
+  local actions      = require("telescope.actions")
+  local action_state = require("telescope.actions.state")
+
+  local phase = "project"
+  local chosen_project = nil
+
+  local picker = pickers.new({}, {
+    prompt_title = "NX Project",
+    finder = finders.new_table({ results = {} }),
+    sorter = conf.generic_sorter({}),
+    attach_mappings = function(prompt_bufnr)
+      actions.select_default:replace(function()
+        local entry = action_state.get_selected_entry()
+        if not entry then return end
+
+        if phase == "project" then
+          chosen_project = entry[1]
+          local targets = get_targets_for_project(chosen_project)
+          if vim.tbl_isempty(targets) then
+            vim.notify("nx.nvim: no targets for " .. chosen_project, vim.log.levels.WARN)
+            return
+          end
+          phase = "target"
+          local p = action_state.get_current_picker(prompt_bufnr)
+          p.prompt_title = "NX Target (" .. chosen_project .. ")"
+          p:refresh(finders.new_table({ results = targets }), { reset_prompt = true })
+        else
+          actions.close(prompt_bufnr)
+          M.run(chosen_project, entry[1])
+        end
+      end)
+      return true
+    end,
+  })
+  picker:find()
+
+  get_projects_async(function(projects)
+    if vim.tbl_isempty(projects) then
+      vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
+      return
+    end
+    picker:refresh(finders.new_table({ results = projects }), { reset_prompt = true })
+  end)
+
+  return true
+end
+
 function M.pick_project_target()
+  if pick_with_telescope() then return end
+
+  -- fallback: two-step vim.ui.select (blocking)
   local projects = get_projects()
   if vim.tbl_isempty(projects) then
     vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
     return
   end
-
   vim.ui.select(projects, { prompt = "NX Project> " }, function(project)
     if not project then return end
-
     local targets = get_targets_for_project(project)
     if vim.tbl_isempty(targets) then
       vim.notify("nx.nvim: no targets for " .. project, vim.log.levels.WARN)
       return
     end
-
     vim.ui.select(targets, { prompt = "NX Target (" .. project .. ")> " }, function(target)
       if not target then return end
       M.run(project, target)
