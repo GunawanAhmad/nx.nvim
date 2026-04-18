@@ -4,15 +4,12 @@ local _cache = { root = nil, projects = nil, targets = {} }
 
 local config = {
   nx_cmd = nil,       -- auto-detected if nil (pnpm/yarn/bun/npx/nx)
-  runner_bin = nil,   -- path to nx-runner binary; auto-resolved if nil
   terminal = "horizontal", -- "horizontal" | "vertical" | "float"
   float_opts = { width = 0.8, height = 0.8 },
 }
 
 -- resolve the nx-runner binary: explicit config > sibling to plugin > PATH
 local function runner_bin()
-  if config.runner_bin then return config.runner_bin end
-  -- try next to the plugin directory (go/nx-runner)
   local src = debug.getinfo(1, "S").source:sub(2)
   local plugin_root = vim.fn.fnamemodify(src, ":h:h:h")
   local candidate = plugin_root .. "/go/nx-runner"

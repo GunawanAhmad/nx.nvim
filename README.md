@@ -46,9 +46,6 @@ require("nx").setup({
   -- e.g. "pnpm nx", "yarn nx", "npx nx"
   nx_cmd = nil,
 
-  -- Path to nx-runner binary (auto-resolved if nil)
-  runner_bin = nil,
-
   -- Terminal split style: "horizontal" | "vertical" | "float"
   terminal = "horizontal",
 
