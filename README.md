@@ -14,21 +14,13 @@ On large monorepos, looking up projects and targets can be slow. The bundled `nx
 
 ## Installation
 
-### 1. Build the binary
-
-```bash
-cd <plugin-dir>/go
-go build -o ~/.local/bin/nx-runner .
-```
-
-Or install it anywhere on your `$PATH`.
-
-### 2. Add the plugin
+The binary is built automatically when you install or update the plugin. No manual build step required.
 
 **lazy.nvim**
 ```lua
 {
   "gunawanahmad/nx.nvim",
+  build = function() require("nx").build() end,
   config = function()
     require("nx").setup()
   end,
@@ -39,6 +31,7 @@ Or install it anywhere on your `$PATH`.
 ```lua
 use {
   "gunawanahmad/nx.nvim",
+  run = function() require("nx").build() end,
   config = function()
     require("nx").setup()
   end,

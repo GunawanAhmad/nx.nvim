@@ -218,6 +218,25 @@ function M.graph()
   run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. detect_nx_cmd(root) .. " graph")
 end
 
+function M.build()
+  local src = debug.getinfo(1, "S").source:sub(2)
+  local plugin_root = vim.fn.fnamemodify(src, ":h:h:h")
+  local go_dir = plugin_root .. "/go"
+  local out = go_dir .. "/nx-runner"
+  if vim.fn.executable("go") == 0 then
+    vim.notify("nx.nvim: 'go' not found — cannot build nx-runner", vim.log.levels.ERROR)
+    return
+  end
+  local result = vim.fn.system(
+    "cd " .. vim.fn.shellescape(go_dir) .. " && go build -o " .. vim.fn.shellescape(out) .. " ."
+  )
+  if vim.v.shell_error ~= 0 then
+    vim.notify("nx.nvim: build failed:\n" .. result, vim.log.levels.ERROR)
+  else
+    vim.notify("nx.nvim: nx-runner built at " .. out, vim.log.levels.INFO)
+  end
+end
+
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
 
