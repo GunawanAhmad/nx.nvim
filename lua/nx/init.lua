@@ -1,6 +1,7 @@
 local M = {}
 
 local _cache = { root = nil, projects = nil, targets = {} }
+local ns = vim.api.nvim_create_namespace("nx_picker")
 
 local config = {
   nx_cmd = nil,       -- auto-detected if nil (pnpm/yarn/bun/npx/nx)
@@ -163,6 +164,50 @@ local function get_targets_for_project(project)
   return targets
 end
 
+local function get_targets_for_project_async(project, cb)
+  local root = get_workspace_root()
+  if not root then cb({}); return end
+  if _cache.root == root and _cache.targets[project] then cb(_cache.targets[project]); return end
+
+  local bin = runner_bin()
+  local cmd
+  if bin then
+    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " targets " .. vim.fn.shellescape(project) .. " 2>/dev/null"
+  else
+    local nx = detect_nx_cmd(root)
+    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show project " .. vim.fn.shellescape(project) .. " --json 2>/dev/null"
+  end
+
+  vim.system({ "sh", "-c", cmd }, { text = true }, function(result)
+    vim.schedule(function()
+      local targets = {}
+      if result.code == 0 then
+        if bin then
+          for _, line in ipairs(vim.split(result.stdout or "", "\n")) do
+            local t = vim.trim(line)
+            if t ~= "" then table.insert(targets, t) end
+          end
+        else
+          local lines = vim.split(result.stdout or "", "\n")
+          local json_start = 0
+          for i, line in ipairs(lines) do
+            if vim.trim(line):sub(1, 1) == "{" then json_start = i; break end
+          end
+          if json_start > 0 then
+            local ok, data = pcall(vim.fn.json_decode, table.concat(lines, "\n", json_start))
+            if ok and type(data) == "table" and data.targets then
+              for target in pairs(data.targets) do table.insert(targets, target) end
+              table.sort(targets)
+            end
+          end
+        end
+      end
+      _cache.targets[project] = targets
+      cb(targets)
+    end)
+  end)
+end
+
 function M.run(project, target, args)
   local root = get_workspace_root()
   if not root then
@@ -191,90 +236,207 @@ function M.run(project, target, args)
   run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. cmd)
 end
 
-local function pick_with_telescope()
-  local ok, pickers  = pcall(require, "telescope.pickers")
-  if not ok then return false end
-  local finders      = require("telescope.finders")
-  local conf         = require("telescope.config").values
-  local actions      = require("telescope.actions")
-  local action_state = require("telescope.actions.state")
+local spin_frames = { "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷" }
+local uv = vim.uv or vim.loop
 
-  local phase = "project"
-  local chosen_project = nil
-
-  local picker = pickers.new({}, {
-    prompt_title = "NX Project",
-    finder = finders.new_table({ results = {} }),
-    sorter = conf.generic_sorter({}),
-    attach_mappings = function(prompt_bufnr)
-      actions.select_default:replace(function()
-        local entry = action_state.get_selected_entry()
-        if not entry then return end
-
-        if phase == "project" then
-          chosen_project = entry[1]
-          local targets = get_targets_for_project(chosen_project)
-          if vim.tbl_isempty(targets) then
-            vim.notify("nx.nvim: no targets for " .. chosen_project, vim.log.levels.WARN)
-            return
-          end
-          phase = "target"
-          local p = action_state.get_current_picker(prompt_bufnr)
-          p.prompt_title = "NX Target (" .. chosen_project .. ")"
-          p:refresh(finders.new_table({ results = targets }), { reset_prompt = true })
-        else
-          actions.close(prompt_bufnr)
-          M.run(chosen_project, entry[1])
-        end
-      end)
-      return true
-    end,
+local function open_float(title)
+  local width  = math.min(60, math.floor(vim.o.columns * 0.6))
+  local height = math.min(30, math.floor(vim.o.lines   * 0.6))
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden  = "wipe"
+  vim.bo[buf].buftype    = "nofile"
+  vim.bo[buf].modifiable = false
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative  = "editor",
+    width     = width, height = height,
+    row       = math.floor((vim.o.lines   - height) / 2),
+    col       = math.floor((vim.o.columns - width)  / 2),
+    style     = "minimal", border = "rounded",
+    title     = title, title_pos = "center",
   })
-  picker:find()
+  vim.wo[win].cursorline = true
+  vim.wo[win].wrap       = false
+  return buf, win
+end
 
+local function set_lines(buf, lines)
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+end
+
+local function create_picker(title, items, on_select)
+  if vim.tbl_isempty(items) then return end
+  local buf, win = open_float(" " .. title .. " ")
+
+  local lines = {}
+  for _, item in ipairs(items) do table.insert(lines, "  " .. item) end
+  set_lines(buf, lines)
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+  end
+
+  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = close })
+
+  local map_opts = { noremap = true, silent = true, buffer = buf, nowait = true }
+  vim.keymap.set("n", "<CR>", function()
+    local row = vim.api.nvim_win_get_cursor(win)[1]
+    local selected = items[row]
+    if selected then close(); on_select(selected) end
+  end, map_opts)
+  vim.keymap.set("n", "q",     close, map_opts)
+  vim.keymap.set("n", "<Esc>", close, map_opts)
+end
+
+local function create_tree_picker(projects, on_run)
+  local buf, win = open_float(" NX ")
+
+  local tree = {}
+  for _, p in ipairs(projects) do
+    table.insert(tree, { name = p, expanded = false, loading = false, targets = nil })
+  end
+
+  local line_map  = {}
+  local spin_idx  = 1
+  local spin_timer = nil
+
+  local function build()
+    local lines = {}
+    line_map = {}
+    for i, node in ipairs(tree) do
+      local icon = node.expanded and "▾" or "▸"
+      table.insert(lines, string.format("  %s %s", icon, node.name))
+      line_map[#lines] = { proj = i }
+      if node.expanded then
+        if node.loading then
+          table.insert(lines, "      " .. spin_frames[spin_idx] .. " loading…")
+          line_map[#lines] = { proj = i, loading = true }
+        elseif node.targets then
+          if #node.targets == 0 then
+            table.insert(lines, "      (no targets)")
+            line_map[#lines] = { proj = i, empty = true }
+          else
+            for _, t in ipairs(node.targets) do
+              table.insert(lines, "    " .. t)
+              line_map[#lines] = { proj = i, target = t }
+            end
+          end
+        end
+      end
+    end
+    return lines
+  end
+
+  local function apply_hl()
+    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+    for lnr, entry in pairs(line_map) do
+      if entry.target then
+        -- leave target rows unstyled; cursorline handles selection
+      elseif entry.loading or entry.empty then
+        vim.api.nvim_buf_add_highlight(buf, ns, "Comment", lnr - 1, 0, -1)
+      else
+        vim.api.nvim_buf_add_highlight(buf, ns, "Title", lnr - 1, 0, -1)
+      end
+    end
+  end
+
+  local function render()
+    set_lines(buf, build())
+    apply_hl()
+  end
+
+  render()
+
+  local function close()
+    if spin_timer then spin_timer:stop(); spin_timer:close(); spin_timer = nil end
+    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+  end
+
+  vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = close })
+
+  local function stop_spinner()
+    for _, node in ipairs(tree) do if node.loading then return end end
+    if spin_timer then spin_timer:stop(); spin_timer:close(); spin_timer = nil end
+  end
+
+  local function start_spinner()
+    if spin_timer then return end
+    spin_timer = uv.new_timer()
+    spin_timer:start(0, 80, vim.schedule_wrap(function()
+      if not vim.api.nvim_win_is_valid(win) then
+        spin_timer:stop(); spin_timer:close(); spin_timer = nil; return
+      end
+      spin_idx = (spin_idx % #spin_frames) + 1
+      render()
+    end))
+  end
+
+  local function toggle_project(node)
+    if node.expanded then
+      node.expanded = false
+      render()
+    else
+      node.expanded = true
+      if node.targets ~= nil then
+        render()
+      else
+        node.loading = true
+        render()
+        start_spinner()
+        get_targets_for_project_async(node.name, function(targets)
+          node.targets = targets
+          node.loading = false
+          stop_spinner()
+          render()
+        end)
+      end
+    end
+  end
+
+  local map_opts = { noremap = true, silent = true, buffer = buf, nowait = true }
+
+  vim.keymap.set("n", "<CR>", function()
+    local entry = line_map[vim.api.nvim_win_get_cursor(win)[1]]
+    if not entry or entry.loading or entry.empty then return end
+    if entry.target then
+      local name = tree[entry.proj].name
+      close(); on_run(name, entry.target)
+    else
+      toggle_project(tree[entry.proj])
+    end
+  end, map_opts)
+
+  vim.keymap.set("n", "<Space>", function()
+    local entry = line_map[vim.api.nvim_win_get_cursor(win)[1]]
+    if entry and not entry.target and not entry.loading and not entry.empty then
+      toggle_project(tree[entry.proj])
+    end
+  end, map_opts)
+
+  vim.keymap.set("n", "q",     close, map_opts)
+  vim.keymap.set("n", "<Esc>", close, map_opts)
+end
+
+function M.pick_project_target()
   get_projects_async(function(projects)
     if vim.tbl_isempty(projects) then
       vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
       return
     end
-    picker:refresh(finders.new_table({ results = projects }), { reset_prompt = true })
-  end)
-
-  return true
-end
-
-function M.pick_project_target()
-  if pick_with_telescope() then return end
-
-  -- fallback: two-step vim.ui.select (blocking)
-  local projects = get_projects()
-  if vim.tbl_isempty(projects) then
-    vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
-    return
-  end
-  vim.ui.select(projects, { prompt = "NX Project> " }, function(project)
-    if not project then return end
-    local targets = get_targets_for_project(project)
-    if vim.tbl_isempty(targets) then
-      vim.notify("nx.nvim: no targets for " .. project, vim.log.levels.WARN)
-      return
-    end
-    vim.ui.select(targets, { prompt = "NX Target (" .. project .. ")> " }, function(target)
-      if not target then return end
-      M.run(project, target)
-    end)
+    create_tree_picker(projects, M.run)
   end)
 end
 
 function M.pick_project()
-  local projects = get_projects()
-  if vim.tbl_isempty(projects) then
-    vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
-    return
-  end
-  vim.ui.select(projects, { prompt = "NX Project> " }, function(project)
-    if not project then return end
-    M.run(project)
+  get_projects_async(function(projects)
+    if vim.tbl_isempty(projects) then
+      vim.notify("nx.nvim: no projects found", vim.log.levels.WARN)
+      return
+    end
+    create_picker("NX Project", projects, function(project)
+      M.run(project)
+    end)
   end)
 end
 
