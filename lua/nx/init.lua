@@ -9,16 +9,6 @@ local config = {
   float_opts = { width = 0.8, height = 0.8 },
 }
 
--- resolve the nx-runner binary: explicit config > sibling to plugin > PATH
-local function runner_bin()
-  local src = debug.getinfo(1, "S").source:sub(2)
-  local plugin_root = vim.fn.fnamemodify(src, ":h:h:h")
-  local candidate = plugin_root .. "/go/nx-runner"
-  if vim.fn.executable(candidate) == 1 then return candidate end
-  if vim.fn.executable("nx-runner") == 1 then return "nx-runner" end
-  return nil
-end
-
 local function get_workspace_root()
   local path = vim.fn.getcwd()
   while path ~= "/" do
@@ -64,57 +54,54 @@ local function run_in_terminal(cmd)
   end
 end
 
--- use nx-runner binary for fast filesystem-based listing
-local function get_projects()
-  local root = get_workspace_root()
-  if not root then return {} end
+-- find all project.json files under root, skipping heavy dirs
+local find_cmd = "find %s \\( -name node_modules -o -name .git -o -name dist -o -name .nx \\) -prune -o -name project.json -print"
 
+-- parse one project.json: returns name, sorted targets (or nil on failure)
+local function parse_project_json(path)
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok then return nil end
+  local ok2, data = pcall(vim.fn.json_decode, table.concat(lines, "\n"))
+  if not ok2 or type(data) ~= "table" or not data.name then return nil end
+  local targets = {}
+  for t in pairs(data.targets or {}) do table.insert(targets, t) end
+  table.sort(targets)
+  return data.name, targets
+end
+
+-- single pass: find every project.json, parse it, cache projects + targets together
+local function scan_workspace(root)
   if _cache.root == root and _cache.projects then return _cache.projects end
-
-  local bin = runner_bin()
-  local cmd
-  if bin then
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null"
-  else
-    local nx = detect_nx_cmd(root)
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null"
-  end
-
-  local raw = vim.fn.systemlist(cmd)
-  if vim.v.shell_error ~= 0 then return {} end
-
+  local paths = vim.fn.systemlist(string.format(find_cmd, vim.fn.shellescape(root)))
   local projects = {}
-  for _, line in ipairs(raw) do
-    local t = vim.trim(line)
-    if t ~= "" and not t:match("^>") then table.insert(projects, t) end
+  for _, path in ipairs(paths) do
+    local name, targets = parse_project_json(vim.trim(path))
+    if name then
+      table.insert(projects, name)
+      _cache.targets[name] = targets
+    end
   end
+  table.sort(projects)
   _cache.root = root
   _cache.projects = projects
   return projects
 end
 
-local function get_projects_async(cb)
-  local root = get_workspace_root()
-  if not root then cb({}); return end
+local function scan_workspace_async(root, cb)
   if _cache.root == root and _cache.projects then cb(_cache.projects); return end
-
-  local bin = runner_bin()
-  local cmd
-  if bin then
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " projects 2>/dev/null"
-  else
-    local nx = detect_nx_cmd(root)
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show projects 2>/dev/null"
-  end
-
+  local cmd = string.format(find_cmd, vim.fn.shellescape(root))
   vim.system({ "sh", "-c", cmd }, { text = true }, function(result)
     vim.schedule(function()
       local projects = {}
       if result.code == 0 then
-        for _, line in ipairs(vim.split(result.stdout or "", "\n")) do
-          local t = vim.trim(line)
-          if t ~= "" and not t:match("^>") then table.insert(projects, t) end
+        for _, path in ipairs(vim.split(result.stdout or "", "\n")) do
+          local name, targets = parse_project_json(vim.trim(path))
+          if name then
+            table.insert(projects, name)
+            _cache.targets[name] = targets
+          end
         end
+        table.sort(projects)
       end
       _cache.root = root
       _cache.projects = projects
@@ -123,88 +110,31 @@ local function get_projects_async(cb)
   end)
 end
 
+local function get_projects()
+  local root = get_workspace_root()
+  if not root then return {} end
+  return scan_workspace(root)
+end
+
+local function get_projects_async(cb)
+  local root = get_workspace_root()
+  if not root then cb({}); return end
+  scan_workspace_async(root, cb)
+end
+
 local function get_targets_for_project(project)
   local root = get_workspace_root()
   if not root then return {} end
-
-  if _cache.root == root and _cache.targets[project] then return _cache.targets[project] end
-
-  local targets = {}
-  local bin = runner_bin()
-  if bin then
-    local raw = vim.fn.systemlist(
-      "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " targets " .. vim.fn.shellescape(project) .. " 2>/dev/null"
-    )
-    if vim.v.shell_error ~= 0 then return {} end
-    for _, line in ipairs(raw) do
-      local t = vim.trim(line)
-      if t ~= "" then table.insert(targets, t) end
-    end
-  else
-    local nx = detect_nx_cmd(root)
-    local result = vim.fn.systemlist(
-      "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show project " .. vim.fn.shellescape(project) .. " --json 2>/dev/null"
-    )
-    if vim.v.shell_error ~= 0 then return {} end
-
-    local json_start = 0
-    for i, line in ipairs(result) do
-      if vim.trim(line):sub(1, 1) == "{" then json_start = i; break end
-    end
-    if json_start == 0 then return {} end
-
-    local ok, data = pcall(vim.fn.json_decode, table.concat(result, "\n", json_start))
-    if not ok or type(data) ~= "table" or not data.targets then return {} end
-
-    for target in pairs(data.targets) do table.insert(targets, target) end
-    table.sort(targets)
-  end
-
-  _cache.targets[project] = targets
-  return targets
+  scan_workspace(root)  -- no-op if already cached
+  return _cache.targets[project] or {}
 end
 
 local function get_targets_for_project_async(project, cb)
   local root = get_workspace_root()
   if not root then cb({}); return end
   if _cache.root == root and _cache.targets[project] then cb(_cache.targets[project]); return end
-
-  local bin = runner_bin()
-  local cmd
-  if bin then
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. bin .. " targets " .. vim.fn.shellescape(project) .. " 2>/dev/null"
-  else
-    local nx = detect_nx_cmd(root)
-    cmd = "cd " .. vim.fn.shellescape(root) .. " && " .. nx .. " show project " .. vim.fn.shellescape(project) .. " --json 2>/dev/null"
-  end
-
-  vim.system({ "sh", "-c", cmd }, { text = true }, function(result)
-    vim.schedule(function()
-      local targets = {}
-      if result.code == 0 then
-        if bin then
-          for _, line in ipairs(vim.split(result.stdout or "", "\n")) do
-            local t = vim.trim(line)
-            if t ~= "" then table.insert(targets, t) end
-          end
-        else
-          local lines = vim.split(result.stdout or "", "\n")
-          local json_start = 0
-          for i, line in ipairs(lines) do
-            if vim.trim(line):sub(1, 1) == "{" then json_start = i; break end
-          end
-          if json_start > 0 then
-            local ok, data = pcall(vim.fn.json_decode, table.concat(lines, "\n", json_start))
-            if ok and type(data) == "table" and data.targets then
-              for target in pairs(data.targets) do table.insert(targets, target) end
-              table.sort(targets)
-            end
-          end
-        end
-      end
-      _cache.targets[project] = targets
-      cb(targets)
-    end)
+  scan_workspace_async(root, function()
+    cb(_cache.targets[project] or {})
   end)
 end
 
@@ -214,25 +144,13 @@ function M.run(project, target, args)
     vim.notify("nx.nvim: nx.json not found in any parent directory", vim.log.levels.ERROR)
     return
   end
-
-  local bin = runner_bin()
-  local cmd
-  if bin and project and target then
-    cmd = bin .. " run " .. vim.fn.shellescape(project) .. " " .. vim.fn.shellescape(target)
-    if args and args ~= "" then cmd = cmd .. " " .. args end
-  else
-    local nx = detect_nx_cmd(root)
-    if project and target then
-      cmd = nx .. " run " .. project .. ":" .. target
-      if args and args ~= "" then cmd = cmd .. " " .. args end
-    elseif project then
-      cmd = nx .. " " .. project
-    else
-      vim.notify("nx.nvim: project required", vim.log.levels.WARN)
-      return
-    end
+  if not project then
+    vim.notify("nx.nvim: project required", vim.log.levels.WARN)
+    return
   end
-
+  local nx = detect_nx_cmd(root)
+  local cmd = target and (nx .. " run " .. project .. ":" .. target) or (nx .. " " .. project)
+  if args and args ~= "" then cmd = cmd .. " " .. args end
   run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. cmd)
 end
 
@@ -467,24 +385,6 @@ function M.graph()
   run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. detect_nx_cmd(root) .. " graph")
 end
 
-function M.build()
-  local src = debug.getinfo(1, "S").source:sub(2)
-  local plugin_root = vim.fn.fnamemodify(src, ":h:h:h")
-  local go_dir = plugin_root .. "/go"
-  local out = go_dir .. "/nx-runner"
-  if vim.fn.executable("go") == 0 then
-    vim.notify("nx.nvim: 'go' not found — cannot build nx-runner", vim.log.levels.ERROR)
-    return
-  end
-  local result = vim.fn.system(
-    "cd " .. vim.fn.shellescape(go_dir) .. " && go build -o " .. vim.fn.shellescape(out) .. " ."
-  )
-  if vim.v.shell_error ~= 0 then
-    vim.notify("nx.nvim: build failed:\n" .. result, vim.log.levels.ERROR)
-  else
-    vim.notify("nx.nvim: nx-runner built at " .. out, vim.log.levels.INFO)
-  end
-end
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})

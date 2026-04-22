@@ -1,26 +1,19 @@
 # nx.nvim
 
-Run NX targets without leaving Neovim. Pick any project and target from a fuzzy menu and run it in a split.
-
-## Why
-
-On large monorepos, looking up projects and targets can be slow. The bundled `nx-runner` binary walks the filesystem and parses `project.json` files directly, making listings near-instant.
+Run NX targets without leaving Neovim. Pick any project and target from a native tree UI and run it in a split.
 
 ## Requirements
 
 - Neovim 0.9+
-- Go 1.21+ (to build the binary)
+- `find` (POSIX standard, available everywhere)
 - An NX workspace (`nx.json` present)
 
 ## Installation
-
-The binary is built automatically when you install or update the plugin. No manual build step required.
 
 **lazy.nvim**
 ```lua
 {
   "gunawanahmad/nx.nvim",
-  build = function() require("nx").build() end,
   config = function()
     require("nx").setup()
   end,
@@ -31,12 +24,13 @@ The binary is built automatically when you install or update the plugin. No manu
 ```lua
 use {
   "gunawanahmad/nx.nvim",
-  run = function() require("nx").build() end,
   config = function()
     require("nx").setup()
   end,
 }
 ```
+
+No build step. No compiled binary. No extra dependencies.
 
 ## Setup
 
@@ -60,14 +54,39 @@ require("nx").setup({
 
 | Command | Description |
 |---|---|
-| `:NxPick` | Interactively select a project then a target and run it |
+| `:NxPick` | Open the project tree, expand a project to see targets, run one |
 | `:NxRun <project> <target> [args]` | Run directly with tab-completion |
 | `:NxAffected [target]` | Run `nx affected --target=<target>` |
 | `:NxGraph` | Open the NX project graph |
+| `:NxRefresh` | Clear the project/target cache |
+
+## UI
+
+`:NxPick` opens a floating tree. All projects are listed collapsed. Press `<CR>` or `<Space>` on a project to expand it — targets are fetched async and shown inline with a loading spinner. Press `<CR>` on a target to run it.
+
+```
+╭─────── NX ────────╮
+│  ▸ api            │
+│  ▾ backend        │   ← expanded
+│    build          │
+│    lint           │
+│    test           │   ← <CR> to run
+│  ▸ frontend       │
+│  ▸ shared         │
+╰───────────────────╯
+```
+
+Keys inside the picker:
+
+| Key | Action |
+|---|---|
+| `<CR>` | Expand/collapse project, or run target |
+| `<Space>` | Expand/collapse project |
+| `q` / `<Esc>` | Close |
 
 ## Package manager detection
 
-The plugin (and binary) automatically detect your package manager from the workspace root:
+Detected automatically from the workspace root lockfile:
 
 | Lockfile | Command used |
 |---|---|
@@ -82,20 +101,20 @@ Override with `nx_cmd` in setup if needed.
 ## Suggested keymaps
 
 ```lua
-vim.keymap.set("n", "<leader>nx", "<cmd>NxPick<cr>", { desc = "NX pick & run" })
+vim.keymap.set("n", "<leader>nx", "<cmd>NxPick<cr>",     { desc = "NX pick & run" })
 vim.keymap.set("n", "<leader>na", "<cmd>NxAffected<cr>", { desc = "NX affected" })
-vim.keymap.set("n", "<leader>ng", "<cmd>NxGraph<cr>", { desc = "NX graph" })
+vim.keymap.set("n", "<leader>ng", "<cmd>NxGraph<cr>",    { desc = "NX graph" })
 ```
 
 ## How it works
 
+On first use, `find` locates every `project.json` in the workspace (skipping `node_modules`, `.git`, `dist`, `.nx`). Each file is parsed and both project names and their targets are cached in a single pass. All subsequent interactions — picker, tab-completion, target expansion — read from cache with no I/O.
+
 ```
 :NxPick
-  └── nx-runner projects          (reads project.json files, no Node spawn)
-        └── vim.ui.select (project)
-              └── nx-runner targets <project>   (parses same project.json)
-                    └── vim.ui.select (target)
+  └── find . -name project.json ...   (one pass, skips heavy dirs)
+        └── parse each project.json   (name + targets cached together)
+              └── floating tree UI    (projects collapsed, expand to load targets)
+                    └── <CR> on target
                           └── terminal: pnpm nx run <project>:<target>
 ```
-
-If `nx-runner` is not found, the plugin falls back to calling the NX CLI directly.
