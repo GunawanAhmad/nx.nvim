@@ -228,15 +228,15 @@ local function create_tree_picker(projects, on_run)
       line_map[#lines] = { proj = i }
       if node.expanded then
         if node.loading then
-          table.insert(lines, "      " .. spin_frames[spin_idx] .. " loading…")
+          table.insert(lines, "    " .. spin_frames[spin_idx] .. " loading…")
           line_map[#lines] = { proj = i, loading = true }
         elseif node.targets then
           if #node.targets == 0 then
-            table.insert(lines, "      (no targets)")
+            table.insert(lines, "    (no targets)")
             line_map[#lines] = { proj = i, empty = true }
           else
             for _, t in ipairs(node.targets) do
-              table.insert(lines, "    " .. t)
+              table.insert(lines, "    › " .. t)
               line_map[#lines] = { proj = i, target = t }
             end
           end
@@ -246,15 +246,20 @@ local function create_tree_picker(projects, on_run)
     return lines
   end
 
+  -- byte offsets for multi-byte UTF-8 chars:
+  --   project row  "  ▸ name"  : icon at [2,5), name at [6,∞)  (▸ = 3 bytes)
+  --   target row   "    › name": bullet at [4,7), name at [8,∞) (› = 3 bytes)
   local function apply_hl()
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
     for lnr, entry in pairs(line_map) do
       if entry.target then
-        -- leave target rows unstyled; cursorline handles selection
+        vim.api.nvim_buf_add_highlight(buf, ns, "NonText",    lnr - 1, 4, 7)
+        vim.api.nvim_buf_add_highlight(buf, ns, "String",     lnr - 1, 8, -1)
       elseif entry.loading or entry.empty then
         vim.api.nvim_buf_add_highlight(buf, ns, "Comment", lnr - 1, 0, -1)
       else
-        vim.api.nvim_buf_add_highlight(buf, ns, "Title", lnr - 1, 0, -1)
+        vim.api.nvim_buf_add_highlight(buf, ns, "Special",  lnr - 1, 2, 5)
+        vim.api.nvim_buf_add_highlight(buf, ns, "Function", lnr - 1, 6, -1)
       end
     end
   end
@@ -385,6 +390,15 @@ function M.graph()
   run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. detect_nx_cmd(root) .. " graph")
 end
 
+function M.reset()
+  local root = get_workspace_root()
+  if not root then
+    vim.notify("nx.nvim: nx.json not found", vim.log.levels.ERROR)
+    return
+  end
+  run_in_terminal("cd " .. vim.fn.shellescape(root) .. " && " .. detect_nx_cmd(root) .. " reset")
+end
+
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
@@ -415,6 +429,9 @@ function M.setup(opts)
 
   vim.api.nvim_create_user_command("NxGraph", function() M.graph() end,
     { desc = "Open nx graph" })
+
+  vim.api.nvim_create_user_command("NxReset", function() M.reset() end,
+    { desc = "Run nx reset to clear the NX computation cache" })
 
   vim.api.nvim_create_user_command("NxRefresh", function()
     _cache.root = nil; _cache.projects = nil; _cache.targets = {}
