@@ -55,14 +55,19 @@ local function run_in_terminal(cmd)
 end
 
 -- find all project.json files under root, skipping heavy dirs
+-- TODO: add support for non find based discovery
 local find_cmd = "find %s \\( -name node_modules -o -name .git -o -name dist -o -name .nx \\) -prune -o -name project.json -print"
 
 -- parse one project.json: returns name, sorted targets (or nil on failure)
 local function parse_project_json(path)
   local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok then return nil end
+  if not ok then return
+    vim.notify("nx.nvim: failed to read " .. path, vim.log.levels.ERROR)
+  end
   local ok2, data = pcall(vim.fn.json_decode, table.concat(lines, "\n"))
-  if not ok2 or type(data) ~= "table" or not data.name then return nil end
+  if not ok2 or type(data) ~= "table" or not data.name then
+    vim.notify("nx.nvim: invalid project.json", vim.log.levels.ERROR)
+  end
   local targets = {}
   for t in pairs(data.targets or {}) do table.insert(targets, t) end
   table.sort(targets)
@@ -258,8 +263,8 @@ local function create_tree_picker(projects, on_run)
       elseif entry.loading or entry.empty then
         vim.api.nvim_buf_add_highlight(buf, ns, "Comment", lnr - 1, 0, -1)
       else
-        vim.api.nvim_buf_add_highlight(buf, ns, "Special",  lnr - 1, 2, 5)
-        vim.api.nvim_buf_add_highlight(buf, ns, "Function", lnr - 1, 6, -1)
+        vim.api.nvim_buf_add_highlight(buf, ns, "Comment",  lnr - 1, 2, 5)
+        vim.api.nvim_buf_add_highlight(buf, ns, "Special", lnr - 1, 6, -1)
       end
     end
   end
