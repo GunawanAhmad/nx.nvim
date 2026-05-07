@@ -61,12 +61,14 @@ local find_cmd = "find %s \\( -name node_modules -o -name .git -o -name dist -o 
 -- parse one project.json: returns name, sorted targets (or nil on failure)
 local function parse_project_json(path)
   local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok then return
-    vim.notify("nx.nvim: failed to read " .. path, vim.log.levels.ERROR)
+  if not ok then
+    vim.notify("nx.nvim: failed to read " .. path .. ": " .. tostring(lines), vim.log.levels.ERROR)
+    return
   end
   local ok2, data = pcall(vim.fn.json_decode, table.concat(lines, "\n"))
   if not ok2 or type(data) ~= "table" or not data.name then
-    vim.notify("nx.nvim: invalid project.json", vim.log.levels.ERROR)
+    vim.notify("nx.nvim: invalid project.json: " .. path, vim.log.levels.ERROR)
+    return
   end
   local targets = {}
   for t in pairs(data.targets or {}) do table.insert(targets, t) end
@@ -80,10 +82,13 @@ local function scan_workspace(root)
   local paths = vim.fn.systemlist(string.format(find_cmd, vim.fn.shellescape(root)))
   local projects = {}
   for _, path in ipairs(paths) do
-    local name, targets = parse_project_json(vim.trim(path))
-    if name then
-      table.insert(projects, name)
-      _cache.targets[name] = targets
+    path = vim.trim(path)
+    if path ~= "" then
+      local name, targets = parse_project_json(path)
+      if name then
+        table.insert(projects, name)
+        _cache.targets[name] = targets
+      end
     end
   end
   table.sort(projects)
@@ -100,10 +105,13 @@ local function scan_workspace_async(root, cb)
       local projects = {}
       if result.code == 0 then
         for _, path in ipairs(vim.split(result.stdout or "", "\n")) do
-          local name, targets = parse_project_json(vim.trim(path))
-          if name then
-            table.insert(projects, name)
-            _cache.targets[name] = targets
+          path = vim.trim(path)
+          if path ~= "" then
+            local name, targets = parse_project_json(path)
+            if name then
+              table.insert(projects, name)
+              _cache.targets[name] = targets
+            end
           end
         end
         table.sort(projects)
